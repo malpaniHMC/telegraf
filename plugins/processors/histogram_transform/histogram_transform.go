@@ -3,6 +3,7 @@ package histogram_transform
 
 import (
 	_ "embed"
+	"sort"
 	"strconv"
 
 	"github.com/influxdata/telegraf"
@@ -13,11 +14,11 @@ import (
 var sampleConfig string
 
 type Histogram struct {
-	FieldName    string    `toml:"field_name"`
-	BucketName   string    `toml:"bucket_name"`
-	BucketBounds []float32 `toml:"bucket_bounds"`
-	Log          telegraf.Logger
-	Cache        map[uint64]Buckets
+	FieldName         string    `toml:"field_name"`
+	BucketName        string    `toml:"bucket_name"`
+	BucketBounds      []float32 `toml:"bucket_bounds"`
+	Log               telegraf.Logger
+	bucketMetricCache map[uint64]telegraf.Metric
 }
 type Buckets map[float32]int //[BucketBound]BucketCount
 func (h *Histogram) GetIndex(slice []float32, n float32) int {
@@ -29,96 +30,91 @@ func (h *Histogram) GetIndex(slice []float32, n float32) int {
 	return -1
 }
 
-func (h *Histogram) ParseFloat(floatString string) float32 {
-	float64Val, parse_err := strconv.ParseFloat(floatString, 32)
-	if parse_err != nil {
-		h.Log.Errorf("Unable to parse to float %v", floatString)
-
-	}
-	return float32(float64Val)
-}
-
 func (h *Histogram) Apply(in ...telegraf.Metric) []telegraf.Metric {
-	h.Log.Errorf("### Length are %d", len(h.Cache))
-	h.Log.Errorf("### %d of metrics ", len(in))
+	h.Log.Errorf("### Length are %d", len(h.bucketMetricCache))
+	h.Log.Errorf("### Got %d metrics ", len(in))
+
 	if h.BucketName == "" {
 		h.BucketName = "le"
 	}
 
-	h.Cache[in[0].HashID()] = Buckets{}
-
-	// h.Log.Error("# of metrics ", len(in))
-	// for _, metric := range in {
-	// 	if bucketCount, isPresent := metric.GetField(h.FieldName); isPresent {
-	// 		h.Log.Debugf("found metric %s with bucket count %v", metric.Name(), bucketCount.(float64))
-	// 		if bucketBound, set := metric.GetTag(h.BucketName); set {
-	// 			var bucketBoundFloat float32
-	// 			if bucketBound == "+Inf" {
-	// 				bucketBoundFloat = float32(math.Inf(1))
-	// 			} else {
-	// 				var err error
-	// 				bucketBoundFloat64, err := strconv.ParseFloat(bucketBound, 32)
-	// 				if err != nil {
-	// 					h.Log.Errorf("Error converting bucket value %s to integer", bucketBound)
-	// 				}
-	// 				bucketBoundFloat = float32(bucketBoundFloat64)
-	// 			}
-	// 			buckets[bucketBoundFloat] = int(bucketCount.(float64))
-	// 		}
-	// 	}
-	// }
-	// bucketBounds := make([]float32, 0)
-	// for bucketVal := range buckets {
-	// 	bucketBounds = append(bucketBounds, bucketVal)
-	// 	h.Log.Errorf("BucketBounds1: ", bucketVal)
-	// }
-	// sort.Slice(bucketBounds, func(p, q int) bool {
-	// 	return bucketBounds[p] < bucketBounds[q]
-	// })
-	// for _, bound := range bucketBounds {
-	// 	h.Log.Errorf("BucketBounds2: %v", bound)
-	// }
+	// filter metric by field name
+	modified := false
 	for _, metric := range in {
-		if bucketCount, isPresent := metric.GetField(h.FieldName); isPresent {
-			// h.Log.Debugf("Editing metric %s with bucket count %v", metric.Name(), bucketCount.(float64))
-			bucketCount = int(bucketCount.(float64))
-			if bucketBound, set := metric.GetTag(h.BucketName); set {
-				buckets, err := h.Cache[metric.HashID()]
-				if !err {
-					buckets = Buckets{}
-				}
-				bucketBoundFloat := h.ParseFloat(bucketBound)
-				bucketIndex := h.GetIndex(h.BucketBounds, bucketBoundFloat)
-				if bucketIndex == -1 {
-					h.Log.Errorf("bucket bound %v not found. Something is amiss", bucketBoundFloat)
-					continue
-				}
-				buckets[bucketBoundFloat] = bucketCount.(int)
-				// h.Log.Errorf("bucket index of bound %v is %v", bucketBoundFloat, bucketIndex)
-
-				if bucketIndex == 0 {
-					// if int(bucketCount.(float64)) != buckets[bucketBoundFloat] {
-					// 	h.Log.Errorf("Bucket Counts are not matching. Something is amiss")
-					// }
-					metric.AddField((h.FieldName + "_disjoint"), bucketCount.(int))
-				} else {
-					// if int(bucketCount.(float64)) != buckets[bucketBoundFloat] {
-					// 	h.Log.Errorf("Bucket Counts are not matching. Something is amiss")
-					// }
-					prevBucketBound := h.BucketBounds[bucketIndex-1]
-					prevBucketCount, prevCached := buckets[prevBucketBound]
-					if !prevCached {
-						h.Log.Errorf("Unable to calculate disjoint log at the moment")
-						continue
-					}
-					disjointBucketCount := bucketCount.(int) - prevBucketCount
-					h.Log.Errorf("Non-first bucket bound %v with disjoint value %v = %v - %v, with bounds %v and %v", bucketBoundFloat, disjointBucketCount, buckets[bucketBoundFloat], buckets[prevBucketBound], bucketBoundFloat, prevBucketBound)
-					metric.AddField((h.FieldName + "_disjoint"), disjointBucketCount)
-				}
-			}
+		if _, exists := metric.GetField(h.FieldName); !exists {
+			h.Log.Errorf("Not Processing %s %v", metric.Name(), metric.FieldList())
+			continue
 		}
+
+		h.Log.Errorf("Processing %s %v", metric.Name(), metric.FieldList())
+		h.bucketMetricCache[metric.HashID()] = metric
+		metric.Drop()
+		modified = true
 	}
-	return in
+
+	if !modified {
+		return in
+	}
+
+	if len(h.bucketMetricCache) != len(h.BucketBounds)+1 {
+		h.Log.Error("Don't have enough buckets", len(h.bucketMetricCache), len(h.BucketBounds))
+		return in
+	}
+
+	sortedByBound := make([]telegraf.Metric, 0)
+	for _, metric := range h.bucketMetricCache {
+		sortedByBound = append(sortedByBound, metric)
+	}
+
+	sort.Slice(sortedByBound, func(i, j int) bool {
+		bucketBound1Str, _ := sortedByBound[i].GetTag(h.BucketName)
+		bucketBound2Str, _ := sortedByBound[j].GetTag(h.BucketName)
+
+		if bucketBound1Str == "+Inf" {
+			return true
+		}
+
+		if bucketBound2Str == "+Inf" {
+			return false
+		}
+
+		bucketBound1, _ := strconv.ParseFloat(bucketBound1Str, 64)
+		bucketBound2, _ := strconv.ParseFloat(bucketBound2Str, 64)
+		return bucketBound1 > bucketBound2
+	})
+
+	disjointMetricBuckets := h.calculateDisjointBuckets(sortedByBound)
+	h.bucketMetricCache = make(map[uint64]telegraf.Metric)
+	return append(in, disjointMetricBuckets...)
+}
+
+func (h *Histogram) calculateDisjointBuckets(cumulativeMetrics []telegraf.Metric) (disjointMetrics []telegraf.Metric) {
+	for bucketIdx, bucket := range cumulativeMetrics {
+		metric := bucket.Copy()
+		metricValue, _ := metric.GetField(h.FieldName)
+		tag, _ := metric.GetTag(h.BucketName)
+		if bucketIdx == len(cumulativeMetrics)-1 {
+			h.Log.Errorf("Processing the last bucket for %s, value: %v %s", metric.Name(), metricValue, tag)
+			metric.AddField(h.FieldName+"_disjoint", metricValue)
+			// metric.RemoveField(h.FieldName)
+			disjointMetrics = append(disjointMetrics, metric)
+			continue
+		}
+
+		previousValue, _ := cumulativeMetrics[bucketIdx+1].GetField(h.FieldName)
+		previousTag, _ := cumulativeMetrics[bucketIdx+1].GetTag(h.BucketName)
+
+		h.Log.Errorf("Processing the bucket for %s, value: %v %s, previous bucket: %v %s", metric.Name(), metricValue, tag, previousValue, previousTag)
+		metric.AddField(h.FieldName+"_disjoint", convertToFloat(metricValue)-convertToFloat(previousValue))
+		// metric.RemoveField(h.FieldName)
+		disjointMetrics = append(disjointMetrics, metric)
+	}
+
+	return disjointMetrics
+}
+
+func convertToFloat(value interface{}) float64 {
+	return value.(float64)
 }
 
 func (*Histogram) SampleConfig() string {
@@ -128,7 +124,7 @@ func (*Histogram) SampleConfig() string {
 func init() {
 	processors.Add("histogram_transform", func() telegraf.Processor {
 		return &Histogram{
-			Cache: make(map[uint64]Buckets),
+			bucketMetricCache: make(map[uint64]telegraf.Metric),
 		}
 	})
 }
